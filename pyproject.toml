@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drift-llm"
-version = "0.4.0"
+version = "0.5.0"
 description = "Track LLM quality over time with golden prompts"
 readme = "README.md"
 license = {text = "MIT"}
@@ -23,15 +23,13 @@ dependencies = ["httpx>=0.24.0"]
 
 [project.optional-dependencies]
 bedrock = ["boto3>=1.28.0"]
-all = ["boto3>=1.28.0"]
 
 [project.urls]
 Homepage = "https://github.com/ricardosalcedo/drift"
 Repository = "https://github.com/ricardosalcedo/drift"
-Issues = "https://github.com/ricardosalcedo/drift/issues"
 
 [project.scripts]
-drift = "drift:main"
+drift = "drift.cli:main"
 
-[tool.setuptools]
-py-modules = ["drift"]
+[tool.setuptools.packages.find]
+include = ["drift*"]
