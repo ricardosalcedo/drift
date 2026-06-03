@@ -7,62 +7,73 @@ Define golden prompts with grading criteria. Run them against models on a schedu
 ## Install
 
 ```bash
-pip install httpx  # only required dependency
-# Optional: pip install boto3 (for Bedrock provider)
+# From source
+pip install httpx
+git clone https://github.com/ricardosalcedo/drift.git
+cd drift && python3 drift.py --help
+
+# As package (pip install from PyPI — coming soon)
+pip install drift-llm
+drift --help
+
+# Optional providers
+pip install boto3  # for AWS Bedrock
 ```
 
 ## Quick Start
 
 ```bash
-python3 drift.py init                              # 5 golden prompts, 4 categories
-python3 drift.py run --demo                        # no API key needed
-python3 drift.py run --demo --models "gpt-4o-mini,gpt-4o,claude-3-5-sonnet"
-python3 drift.py report                            # trends + statistics + comparison
-python3 drift.py dashboard --once                  # TUI overview
-python3 drift.py alert                             # regression check with significance
+drift init                                          # 5 golden prompts, 4 categories
+drift run --demo                                    # no API key needed
+drift run --demo --models "gpt-4o-mini,gpt-4o,claude-3-5-sonnet"
+drift report                                        # trends + CI + comparison
+drift compare "gpt-4o,gpt-4o-mini"                  # head-to-head
+drift test --a "Explain X" --b "What is X?" --demo  # A/B test
+drift dashboard --once                              # TUI overview
+drift alert                                         # regression check
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `drift init` | Create config with sample golden prompts |
-| `drift run [--demo] [--tag X] [--force]` | Execute prompts (--force ignores cache) |
-| `drift report` | Quality trends with CI, std dev, sparklines |
-| `drift compare "m1,m2"` | Head-to-head with win tracking |
+| `drift init [--force]` | Create `drift.json` with sample golden prompts |
+| `drift run [--demo] [--models M] [--tag T] [--parallel] [--force]` | Execute prompts against models |
+| `drift report [--model M] [--last N]` | Quality trends with CI, sparklines, comparison |
+| `drift compare "m1,m2,..."` | Head-to-head with win tracking |
+| `drift test --a "..." --b "..." [--n 5] [--model M]` | A/B test two prompt variants |
 | `drift versions [prompt_id]` | Prompt version history + significance test |
-| `drift dashboard [--once]` | TUI with sparklines, model table, live refresh |
 | `drift add` | Interactively add a golden prompt |
-| `drift alert` | Regression detection with Welch's t-test |
-| `drift export [--format csv\|json]` | Export all data |
-| `drift history` | Raw run log |
+| `drift alert [--threshold N] [--window N]` | Regression detection with Welch's t-test |
+| `drift check` | Validate `drift.json` (schema, regexes, missing fields) |
+| `drift clean [--cache\|--keep N\|--before DATE\|--all]` | Purge old data |
+| `drift dashboard [--once] [--refresh N]` | TUI with sparklines and live refresh |
+| `drift export [--format csv\|json] [-o file]` | Export all run data |
+| `drift history [--model M] [--last N]` | Raw run log with versions and cache indicator |
+
+All commands support `--json` for machine-readable output.
 
 ## Features
 
-### Core
-- **Dual scoring** — LLM-as-judge + heuristic regex/contains checks
-- **Multi-model comparison** — side-by-side, trend arrows, win tracking
-- **Prompt tags** — group by category (`reasoning`, `code`, `format`, `safety`)
-
-### v0.3
+- **Dual scoring** — LLM-as-judge + heuristic regex/contains checks, combined
+- **Multi-model comparison** — side-by-side scores, trend arrows, win tracking
+- **A/B prompt testing** — test two prompt variants with statistical significance
 - **Prompt versioning** — auto-detects text changes, tracks scores per version
-- **Statistical confidence** — std dev, confidence intervals, Welch's t-test
+- **Statistical confidence** — μ, σ, 95% CI (t-distribution), Welch's t-test
 - **Response caching** — skip unchanged prompts (configurable TTL, `--force` to override)
+- **Parallel execution** — `--parallel` runs evaluations concurrently via ThreadPool
+- **Native providers** — OpenAI, Anthropic, Ollama, Bedrock (auto-detected from model name)
 - **TUI dashboard** — sparklines, model table, live refresh
-- **Native providers** — Anthropic, Ollama, Bedrock (no proxy needed)
-- **Provider auto-detection** — routes based on model name
-
-### Infrastructure
 - **Cost tracking** — per-run and cumulative with token-level pricing
 - **Retry logic** — exponential backoff for rate limits and transient errors
-- **Colored output** — respects `NO_COLOR` env / `--no-color` flag
-- **JSON output** — `--json` on every command for CI/scripting
+- **Config validation** — `drift check` catches schema errors before you waste API calls
 - **Alert channels** — stdout, `file:path`, or webhook URL
-- **Export** — CSV or JSON dump of all run data
+- **Colored output** — respects `NO_COLOR` env / `--no-color` flag
+- **Prompt tags** — filter runs by category (`reasoning`, `code`, `format`, `safety`)
 
 ## Providers
 
-Drift auto-detects the provider from model name, or you can set it explicitly:
+Auto-detected from model name, or set `"provider"` explicitly in config:
 
 | Provider | Config | Models |
 |----------|--------|--------|
@@ -70,7 +81,7 @@ Drift auto-detects the provider from model name, or you can set it explicitly:
 | Anthropic | `ANTHROPIC_API_KEY` env | claude-3-5-sonnet, claude-3-opus, etc. |
 | Ollama | `ollama_url` (default: localhost:11434) | llama3, mistral, etc. |
 | Bedrock | `bedrock_region` + AWS creds | us.anthropic.*, amazon.*, meta.* |
-| Any OpenAI-compatible | Set `base_url` | vLLM, LiteLLM, etc. |
+| Any OpenAI-compatible | Set `base_url` | vLLM, LiteLLM, Together, etc. |
 
 ## Configuration
 
@@ -87,49 +98,100 @@ Drift auto-detects the provider from model name, or you can set it explicitly:
   "alert_threshold": 15,
   "alert_channels": ["stdout", "file:drift-alerts.log"],
   "cache_hours": 24,
-  "prompts": [...]
+  "prompts": [
+    {
+      "id": "reasoning-basic",
+      "tags": ["reasoning"],
+      "prompt": "Explain why the sky is blue in 3 sentences.",
+      "criteria": "Scientifically accurate, exactly 3 sentences",
+      "checks": [
+        {"type": "contains", "value": "scatter"},
+        {"type": "regex", "value": "\\. .+\\. .+\\."}
+      ]
+    }
+  ]
 }
 ```
+
+### Heuristic Checks
+
+| Type | Description |
+|------|-------------|
+| `contains` | Case-insensitive substring match |
+| `not_contains` | Must NOT contain string |
+| `regex` | Match regex pattern |
+| `min_length` | Minimum character count |
+| `max_length` | Maximum character count |
 
 ## Statistics
 
 Report shows per-prompt:
-- **μ** — mean score
-- **σ** — standard deviation
+- **μ** — mean score | **σ** — standard deviation
 - **CI** — 95% confidence interval (t-distribution)
 - **Sparkline** — visual trend of recent scores
 
-Alert uses **Welch's t-test** to determine if a regression is statistically significant (p<0.05). Only significant regressions cause non-zero exit.
+Alert uses **Welch's t-test** — only *statistically significant* regressions (p<0.05) cause non-zero exit code.
+
+## A/B Testing
+
+Compare two prompt variants head-to-head:
+
+```bash
+drift test \
+  --a "Explain photosynthesis in 2 sentences" \
+  --b "How do plants make food? Answer in 2 sentences" \
+  --model gpt-4o-mini --n 10
+```
+
+Reports mean, CI, and Welch's t-test significance for each variant.
 
 ## Prompt Versioning
 
-When you change a prompt's text or criteria in `drift.json`, drift auto-detects the change and creates a new version. View history with:
+When you change a prompt's text or criteria in `drift.json`, drift auto-detects the change and creates a new version:
 
 ```bash
 drift versions                    # all prompts
-drift versions reasoning-basic    # specific prompt + cross-version comparison
+drift versions reasoning-basic    # specific prompt + cross-version t-test
 ```
 
 ## Automation
 
 ```bash
-# Daily cron with caching (skip unchanged prompts)
-0 6 * * * cd ~/drift && python3 drift.py run && python3 drift.py alert
+# Daily cron
+0 6 * * * cd ~/drift && drift run && drift alert
 
-# Force fresh evaluation (ignore cache)
-python3 drift.py run --force
+# Parallel (faster for many models)
+drift run --parallel --models "gpt-4o-mini,gpt-4o,claude-3-5-sonnet"
 
 # CI gate
-python3 drift.py run && python3 drift.py alert --threshold 10 --json
+drift run && drift alert --threshold 10 --json
+
+# GitHub Actions — see .github/workflows/drift.yml
 ```
 
-## Design
+## Project Structure
 
-- **Single file** — `drift.py` (894 lines), zero package structure
-- **SQLite** — local storage with auto-migration
-- **Minimal deps** — only `httpx` required (boto3 optional for Bedrock)
+```
+drift/
+├── __init__.py      # Version
+├── __main__.py      # python -m drift
+├── cli.py           # 13 commands + argument parsing
+├── config.py        # Load, save, validate, defaults
+├── db.py            # Schema, migrations, versioning, cache
+├── display.py       # Colors, sparkline, bar chart
+├── providers.py     # OpenAI, Anthropic, Ollama, Bedrock, demo
+├── scoring.py       # LLM-as-judge, heuristics, combined evaluate()
+└── stats.py         # std_dev, confidence_interval, welch_t_test
+```
+
+## Design Principles
+
+- **Modular** — each module has one responsibility, no circular deps
+- **DRY** — shared scoring, display, and comparison logic
+- **Minimal deps** — only `httpx` required (boto3 optional)
+- **SQLite** — zero-setup local storage with auto-migration
 - **No daemon** — use cron/systemd for scheduling
-- **Exit codes** — `alert` returns 1 only on *statistically significant* regression
+- **CI-friendly** — JSON output, non-zero exit on significant regression
 
 ## License
 
