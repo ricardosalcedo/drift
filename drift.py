@@ -10,7 +10,7 @@ try:
 except ImportError:
     httpx = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 DB_PATH = Path("drift.db")
 CONFIG_PATH = Path("drift.json")
@@ -318,20 +318,50 @@ def call_llm(config, model, messages, temperature=0.0):
         return call_openai_compat(base_url, api_key, model, messages, temperature)
 
 def call_llm_demo(model, messages, temperature=0.0):
-    """Simulated LLM for demo mode."""
+    """Simulated LLM with realistic score variance. Simulates drift over time."""
     import random
     prompt = messages[-1]["content"]
-    seed = int(hashlib.md5(f"{model}{prompt}{datetime.now().isoformat()[:13]}".encode()).hexdigest()[:8], 16)
+    # Use hour-level granularity so repeated runs within same hour are stable,
+    # but different hours produce different scores (simulates daily drift)
+    hour_key = datetime.now().strftime("%Y%m%d%H")
+    seed = int(hashlib.md5(f"{model}{prompt}{hour_key}".encode()).hexdigest()[:8], 16)
     rng = random.Random(seed)
+    
+    # Model-specific quality baselines (simulate real quality differences)
+    model_quality = {"gpt-4o": 0.85, "gpt-4o-mini": 0.70, "gpt-4": 0.80,
+                     "claude-3-5-sonnet": 0.82, "claude-3-opus": 0.88, "claude-3-haiku": 0.65,
+                     "gpt-3.5-turbo": 0.55}
+    base = model_quality.get(model, 0.7)
+    for k, v in model_quality.items():
+        if model.startswith(k): base = v; break
+    
+    # Add time-based drift: slight degradation over days (resets weekly)
+    day_of_week = datetime.now().weekday()
+    drift_factor = 1.0 - (day_of_week * 0.02)  # Mon=1.0, Sun=0.88
+    
+    # Generate response (some pass heuristic checks, some don't — based on quality)
     responses = [
-        "The answer involves careful consideration of multiple factors. First, we need to understand the context.",
-        "Here's a concise answer: the key insight is that systems evolve over time and require monitoring.",
-        "Let me break this down step by step:\n1. Identify the core problem\n2. Apply systematic analysis\n3. Validate results",
-        "Based on my analysis, the most important factor is consistency in evaluation methodology.",
-        "This is a complex topic. The short answer is: it depends on your specific requirements and constraints.",
+        f"The sky is blue due to Rayleigh scattering. Shorter blue wavelengths scatter more than red. This makes the sky appear blue to observers on Earth.",
+        f"Here's a concise answer: the key insight is that systems evolve over time and require monitoring.",
+        f'def is_palindrome(s):\n    """Check if string is palindrome."""\n    return s.lower() == s.lower()[::-1]',
+        f'{{"name": "Alice", "age": 30, "hobbies": ["reading", "hiking"]}}',
+        f"I can't provide instructions on that topic. It's important to note the legal and ethical concerns.",
+        f"Let me calculate: 17 * 24 = 17 * 20 + 17 * 4 = 340 + 68 = 408. The answer is 408.",
     ]
-    tok_in, tok_out = rng.randint(20, 80), rng.randint(50, 300)
-    return rng.choice(responses), rng.randint(200, 2000), tok_in, tok_out
+    # Pick response semi-randomly but influenced by prompt content
+    prompt_hash = int(hashlib.md5(prompt.encode()).hexdigest()[:4], 16)
+    response = responses[prompt_hash % len(responses)]
+    
+    # Simulate variable latency based on model
+    latency = rng.randint(300, 800) if "mini" in model or "haiku" in model else rng.randint(600, 2500)
+    tok_in = rng.randint(20, 80)
+    tok_out = rng.randint(50, 300)
+    
+    # Sometimes use a "bad" response to simulate quality drops
+    if rng.random() > (base * drift_factor):
+        response = "I'll need more context to provide a complete answer. Could you clarify what specifically you're looking for?"
+    
+    return response, latency, tok_in, tok_out
 
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
@@ -450,7 +480,33 @@ def cmd_run(args):
 
     total = len(prompts) * len(models)
     total_cost, cached_count = 0.0, 0
-    print(f"{bold(f'Running {total} evaluations')} ({len(prompts)} prompts × {len(models)} models)\n")
+    print(f"{bold(f'Running {total} evaluations')} ({len(prompts)} prompts × {len(models)} models){' [parallel]' if args.parallel else ''}\n")
+    
+    # Parallel mode
+    if args.parallel and total > 1:
+        import concurrent.futures
+        results_data = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, total)) as executor:
+            futures = {executor.submit(eval_one_sync, config, model, p, demo, db, models): (model, p)
+                       for model in models for p in prompts}
+            for future in concurrent.futures.as_completed(futures):
+                r = future.result()
+                model, p = futures[future]
+                version = r["version"]
+                sc = r["score"]
+                score_color = green if (sc or 0) >= 7 else yellow if (sc or 0) >= 5 else red
+                lat = r["latency"]
+                print(f"  {dim(r['model'])} / {r['prompt_id']}... {score_color(f'{sc}/10')} {dim(f'({lat}ms)')}")
+                if r["cost"]: total_cost += r["cost"]
+                db.execute("INSERT INTO runs (timestamp,model,prompt_id,prompt_version,prompt,response,score,judge_reason,latency_ms,tokens_in,tokens_out,cost_usd,tags,cached) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (ts, r["model"], r["prompt_id"], r["version"], r["prompt_text"], r["response"], r["score"], r["reason"], r["latency"], r["tok_in"], r["tok_out"], r["cost"], r["tags"], 0))
+                results_data.append({"model": r["model"], "prompt_id": r["prompt_id"], "score": r["score"], "latency_ms": r["latency"], "cost_usd": r["cost"]})
+        db.commit()
+        cache_msg = ""
+        print(f"\n{green('✓')} Run complete. {dim(f'Cost: ${total_cost:.4f}' if total_cost else '')}")
+        if args.json:
+            print(json.dumps({"timestamp": ts, "results": results_data, "total_cost_usd": total_cost}, indent=2))
+        return
     
     results = []
     for model in models:
@@ -831,6 +887,313 @@ def cmd_history(args):
         print(f"  {dim(ts):<24} {r['model']:<16} {r['prompt_id']:<20} {ver:<5} {sc(f'{s}/10') if s else 'N/A':<7} {r['latency_ms']}ms{'':<2} {cached}")
     if args.json: print(json.dumps([dict(r) for r in rows], indent=2))
 
+# ─── A/B Prompt Testing ──────────────────────────────────────────────────────
+
+def cmd_test(args):
+    """A/B test two prompt variants against same criteria."""
+    config = load_config()
+    db = get_db()
+    demo = args.demo
+    model = args.model or config["models"][0]
+    judge_model = config.get("judge_model", model)
+    n = args.n or 5
+    
+    print(f"\n{bold('A/B PROMPT TEST')}")
+    print(f"  Model: {model} | Runs per variant: {n}\n")
+    
+    prompt_a = args.a
+    prompt_b = args.b
+    criteria = args.criteria or "Quality, accuracy, helpfulness, and clarity"
+    
+    if not prompt_a or not prompt_b:
+        print("Error: provide --a and --b prompt variants", file=sys.stderr); sys.exit(1)
+    
+    print(f"  {bold('A:')} {prompt_a[:60]}{'...' if len(prompt_a)>60 else ''}")
+    print(f"  {bold('B:')} {prompt_b[:60]}{'...' if len(prompt_b)>60 else ''}")
+    print(f"  {dim(f'Criteria: {criteria}')}\n")
+    
+    scores_a, scores_b = [], []
+    
+    for i in range(n):
+        sys.stdout.write(f"  Round {i+1}/{n}...")
+        sys.stdout.flush()
+        
+        # Run A
+        if demo:
+            resp_a, lat_a, _, _ = call_llm_demo(model, [{"role": "user", "content": prompt_a}])
+        else:
+            resp_a, lat_a, _, _ = call_llm(config, model, [{"role": "user", "content": prompt_a}])
+        sa, _ = score_with_judge(config, judge_model, prompt_a, resp_a, criteria, demo=demo)
+        if sa: scores_a.append(sa)
+        
+        # Run B
+        if demo:
+            resp_b, lat_b, _, _ = call_llm_demo(model, [{"role": "user", "content": prompt_b}])
+        else:
+            resp_b, lat_b, _, _ = call_llm(config, model, [{"role": "user", "content": prompt_b}])
+        sb, _ = score_with_judge(config, judge_model, prompt_b, resp_b, criteria, demo=demo)
+        if sb: scores_b.append(sb)
+        
+        print(f" A={sa} B={sb}")
+    
+    if not scores_a or not scores_b:
+        print("\n  No valid scores produced."); return
+    
+    mean_a, ci_a_lo, ci_a_hi = confidence_interval(scores_a)
+    mean_b, ci_b_lo, ci_b_hi = confidence_interval(scores_b)
+    t_stat, significant = welch_t_test(scores_a, scores_b)
+    
+    print(f"\n  {bold('RESULTS')}")
+    print(f"  A: μ={mean_a:.2f} CI=[{ci_a_lo:.1f}, {ci_a_hi:.1f}] σ={std_dev(scores_a):.2f}")
+    print(f"  B: μ={mean_b:.2f} CI=[{ci_b_lo:.1f}, {ci_b_hi:.1f}] σ={std_dev(scores_b):.2f}")
+    print(f"  t-stat: {t_stat:.3f} | {'SIGNIFICANT (p<0.05)' if significant else 'not significant'}")
+    
+    if significant:
+        winner = "A" if mean_a > mean_b else "B"
+        print(f"\n  {green(f'★ WINNER: Variant {winner}')} ({bold(f'+{abs(mean_a-mean_b):.1f} points')})")
+    else:
+        print(f"\n  {yellow('≈ No significant difference')} (need more runs or variants are equivalent)")
+    
+    if args.json:
+        print(json.dumps({"a": {"mean": mean_a, "ci": [ci_a_lo, ci_a_hi], "scores": scores_a},
+                          "b": {"mean": mean_b, "ci": [ci_b_lo, ci_b_hi], "scores": scores_b},
+                          "t_stat": t_stat, "significant": significant,
+                          "winner": ("A" if mean_a > mean_b else "B") if significant else None}, indent=2))
+
+# ─── Config Validation ───────────────────────────────────────────────────────
+
+def cmd_check(args):
+    """Validate drift.json config."""
+    if not CONFIG_PATH.exists():
+        print(f"{red('✗')} No config file found. Run 'drift init'."); sys.exit(1)
+    
+    try:
+        config = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as e:
+        print(f"{red('✗')} Invalid JSON: {e}"); sys.exit(1)
+    
+    warnings, errors = [], []
+    
+    # Required fields
+    for field in ["models", "prompts"]:
+        if field not in config:
+            errors.append(f"Missing required field: '{field}'")
+    
+    # Models
+    if not config.get("models"):
+        errors.append("'models' list is empty")
+    
+    # Prompts validation
+    prompt_ids = set()
+    for i, p in enumerate(config.get("prompts", [])):
+        if "id" not in p:
+            errors.append(f"Prompt #{i+1} missing 'id'")
+        elif p["id"] in prompt_ids:
+            errors.append(f"Duplicate prompt id: '{p['id']}'")
+        else:
+            prompt_ids.add(p["id"])
+        
+        if "prompt" not in p:
+            errors.append(f"Prompt '{p.get('id', f'#{i+1}')}' missing 'prompt' text")
+        
+        if not p.get("criteria") and not p.get("checks"):
+            warnings.append(f"Prompt '{p.get('id', f'#{i+1}')}' has no criteria or checks — scoring will be unreliable")
+        
+        for j, ck in enumerate(p.get("checks", [])):
+            if "type" not in ck:
+                errors.append(f"Prompt '{p.get('id')}' check #{j+1} missing 'type'")
+            elif ck["type"] not in ("contains", "not_contains", "regex", "min_length", "max_length"):
+                warnings.append(f"Prompt '{p.get('id')}' check #{j+1} unknown type: '{ck['type']}'")
+            if "value" not in ck:
+                errors.append(f"Prompt '{p.get('id')}' check #{j+1} missing 'value'")
+            if ck.get("type") == "regex":
+                try:
+                    re.compile(ck.get("value", ""))
+                except re.error as e:
+                    errors.append(f"Prompt '{p.get('id')}' check #{j+1} invalid regex: {e}")
+    
+    # Provider config
+    provider = config.get("provider", "auto")
+    if provider not in ("auto", "openai", "anthropic", "ollama", "bedrock"):
+        warnings.append(f"Unknown provider '{provider}' — will fallback to openai")
+    
+    api_key_env = config.get("api_key_env", "OPENAI_API_KEY")
+    if not os.environ.get(api_key_env):
+        warnings.append(f"Env var '{api_key_env}' not set (needed for live runs)")
+    
+    # Alert config
+    threshold = config.get("alert_threshold")
+    if threshold is not None and (threshold <= 0 or threshold > 100):
+        warnings.append(f"alert_threshold={threshold} seems unusual (expected 1-100)")
+    
+    # Report
+    print(f"\n  {bold('Config Validation:')} {CONFIG_PATH}\n")
+    print(f"  Prompts: {len(config.get('prompts', []))} | Models: {len(config.get('models', []))} | Provider: {provider}")
+    
+    if errors:
+        print(f"\n  {red(f'✗ {len(errors)} error(s):')}")
+        for e in errors: print(f"    • {e}")
+    if warnings:
+        print(f"\n  {yellow(f'⚠ {len(warnings)} warning(s):')}")
+        for w in warnings: print(f"    • {w}")
+    if not errors and not warnings:
+        print(f"\n  {green('✓ Config is valid. No issues found.')}")
+    
+    if errors: sys.exit(1)
+
+# ─── Clean ───────────────────────────────────────────────────────────────────
+
+def cmd_clean(args):
+    """Purge old runs, cache, or reset DB."""
+    db = get_db()
+    
+    if args.all:
+        os.remove(str(DB_PATH))
+        print(f"{green('✓')} Deleted {DB_PATH} (all data removed)")
+        return
+    
+    if args.cache:
+        db.execute("DELETE FROM cache")
+        db.commit()
+        print(f"{green('✓')} Cache cleared")
+        return
+    
+    if args.before:
+        try:
+            cutoff = args.before
+            deleted = db.execute("DELETE FROM runs WHERE timestamp < ?", (cutoff,)).rowcount
+            db.commit()
+            print(f"{green('✓')} Deleted {deleted} runs before {cutoff}")
+        except Exception as e:
+            print(f"{red('Error:')} {e}"); sys.exit(1)
+        return
+    
+    if args.keep:
+        # Keep only the last N runs per model/prompt combo
+        keep = args.keep
+        combos = db.execute("SELECT DISTINCT model, prompt_id FROM runs").fetchall()
+        total_deleted = 0
+        for combo in combos:
+            ids_to_keep = [r["id"] for r in db.execute(
+                "SELECT id FROM runs WHERE model=? AND prompt_id=? ORDER BY timestamp DESC LIMIT ?",
+                (combo["model"], combo["prompt_id"], keep)).fetchall()]
+            if ids_to_keep:
+                placeholders = ",".join("?" * len(ids_to_keep))
+                deleted = db.execute(f"DELETE FROM runs WHERE model=? AND prompt_id=? AND id NOT IN ({placeholders})",
+                                     [combo["model"], combo["prompt_id"]] + ids_to_keep).rowcount
+                total_deleted += deleted
+        db.commit()
+        print(f"{green('✓')} Kept last {keep} runs per prompt. Deleted {total_deleted} old records.")
+        return
+    
+    # Default: show stats
+    runs = db.execute("SELECT COUNT(*) as n FROM runs").fetchone()["n"]
+    cache = db.execute("SELECT COUNT(*) as n FROM cache").fetchone()["n"]
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    print(f"  Runs: {runs} | Cache: {cache} entries | DB size: {db_size/1024:.1f}KB")
+    print(f"\n  Options:")
+    print(f"    --cache          Clear response cache")
+    print(f"    --keep N         Keep last N runs per prompt (delete older)")
+    print(f"    --before DATE    Delete runs before date (ISO format)")
+    print(f"    --all            Delete entire database")
+
+# ─── Parallel Run ────────────────────────────────────────────────────────────
+
+def run_parallel(config, models, prompts, demo, ts, db):
+    """Run evaluations concurrently using asyncio + httpx."""
+    import asyncio
+    
+    async def eval_one(model, p):
+        pid, prompt_text = p["id"], p["prompt"]
+        criteria = p.get("criteria", "")
+        tags = ",".join(p.get("tags", []))
+        judge_model = config.get("judge_model", models[0])
+        version = get_prompt_version(db, pid, prompt_text, criteria)
+        
+        messages = [{"role": "user", "content": prompt_text}]
+        if demo:
+            response, latency, tok_in, tok_out = call_llm_demo(model, messages)
+        else:
+            response, latency, tok_in, tok_out = call_llm(config, model, messages)
+        
+        h_score, h_reason = score_with_heuristics(response, p.get("checks", []))
+        j_score, j_reason = score_with_judge(config, judge_model, prompt_text, response, criteria, demo=demo)
+        
+        if h_score is not None and j_score is not None:
+            score = round((h_score + j_score) / 2, 1)
+            reason = f"H:{h_score}({h_reason}) J:{j_score}({j_reason})"
+        elif j_score is not None:
+            score, reason = j_score, j_reason
+        else:
+            score, reason = h_score, h_reason
+        
+        cost = estimate_cost(model, tok_in, tok_out)
+        return {"model": model, "prompt_id": pid, "prompt_text": prompt_text, "response": response,
+                "score": score, "reason": reason, "latency": latency, "tok_in": tok_in,
+                "tok_out": tok_out, "cost": cost, "tags": tags, "version": version}
+    
+    async def run_all():
+        tasks = [eval_one(model, p) for model in models for p in prompts]
+        return await asyncio.gather(*[asyncio.to_thread(lambda t=t: t) for t in [eval_one(m, p) for m in models for p in prompts]])
+    
+    # For demo mode, just run sequentially since async won't help with fake calls
+    # For real mode, use thread pool
+    results = []
+    if demo:
+        for model in models:
+            for p in prompts:
+                results.append(asyncio.run(asyncio.to_thread(eval_one, model, p)) if False else None)
+        # Actually just run sync for demo
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(eval_one_sync, config, model, p, demo, db, models)
+                       for model in models for p in prompts]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(eval_one_sync, config, model, p, demo, db, models)
+                       for model in models for p in prompts]
+            for f in concurrent.futures.as_completed(futures):
+                results.append(f.result())
+    return results
+
+def eval_one_sync(config, model, p, demo, db, models):
+    """Synchronous single evaluation for thread pool."""
+    pid, prompt_text = p["id"], p["prompt"]
+    criteria = p.get("criteria", "")
+    tags = ",".join(p.get("tags", []))
+    judge_model = config.get("judge_model", models[0])
+    
+    # Thread-local DB connection for versioning
+    local_db = sqlite3.connect(str(DB_PATH))
+    local_db.row_factory = sqlite3.Row
+    version = get_prompt_version(local_db, pid, prompt_text, criteria)
+    local_db.close()
+    
+    messages = [{"role": "user", "content": prompt_text}]
+    if demo:
+        response, latency, tok_in, tok_out = call_llm_demo(model, messages)
+    else:
+        response, latency, tok_in, tok_out = call_llm(config, model, messages)
+    
+    h_score, h_reason = score_with_heuristics(response, p.get("checks", []))
+    j_score, j_reason = score_with_judge(config, judge_model, prompt_text, response, criteria, demo=demo)
+    
+    if h_score is not None and j_score is not None:
+        score = round((h_score + j_score) / 2, 1)
+        reason = f"H:{h_score}({h_reason}) J:{j_score}({j_reason})"
+    elif j_score is not None:
+        score, reason = j_score, j_reason
+    else:
+        score, reason = h_score, h_reason
+    
+    cost = estimate_cost(model, tok_in, tok_out)
+    return {"model": model, "prompt_id": pid, "prompt_text": prompt_text, "response": response,
+            "score": score, "reason": reason, "latency": latency, "tok_in": tok_in,
+            "tok_out": tok_out, "cost": cost, "tags": tags, "version": version}
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def load_config():
@@ -852,6 +1215,7 @@ def main():
     p.add_argument("--demo", action="store_true"); p.add_argument("--models", help="Comma-separated models")
     p.add_argument("--tag", help="Filter by tag"); p.add_argument("--json", action="store_true")
     p.add_argument("--force", action="store_true", help="Ignore cache, re-run all")
+    p.add_argument("--parallel", action="store_true", help="Run evaluations concurrently")
 
     p = sub.add_parser("report", help="Quality trends with statistics")
     p.add_argument("--model"); p.add_argument("--last", type=int); p.add_argument("--json", action="store_true")
@@ -870,6 +1234,23 @@ def main():
     p.add_argument("--threshold", type=float); p.add_argument("--window", type=int)
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("test", help="A/B test two prompt variants")
+    p.add_argument("--a", required=True, help="Prompt variant A")
+    p.add_argument("--b", required=True, help="Prompt variant B")
+    p.add_argument("--criteria", help="Judging criteria")
+    p.add_argument("--model", help="Model to test with")
+    p.add_argument("--n", type=int, help="Runs per variant (default: 5)")
+    p.add_argument("--demo", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("check", help="Validate drift.json config")
+
+    p = sub.add_parser("clean", help="Purge old runs, cache, or reset")
+    p.add_argument("--cache", action="store_true", help="Clear response cache")
+    p.add_argument("--keep", type=int, help="Keep last N runs per prompt")
+    p.add_argument("--before", help="Delete runs before date (ISO format)")
+    p.add_argument("--all", action="store_true", help="Delete entire database")
+
     p = sub.add_parser("dashboard", help="TUI dashboard")
     p.add_argument("--refresh", type=int, default=5, help="Refresh interval (seconds)")
     p.add_argument("--once", action="store_true", help="Render once and exit")
@@ -887,7 +1268,8 @@ def main():
     if not args.command: parser.print_help(); sys.exit(1)
 
     cmds = {"init": cmd_init, "run": cmd_run, "report": cmd_report, "compare": cmd_compare,
-            "versions": cmd_versions, "add": cmd_add, "alert": cmd_alert, "dashboard": cmd_dashboard,
+            "versions": cmd_versions, "add": cmd_add, "alert": cmd_alert, "test": cmd_test,
+            "check": cmd_check, "clean": cmd_clean, "dashboard": cmd_dashboard,
             "export": cmd_export, "history": cmd_history}
     cmds[args.command](args)
 

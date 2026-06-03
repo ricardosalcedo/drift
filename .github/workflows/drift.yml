@@ -1,0 +1,57 @@
+name: Drift Quality Check
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6am UTC
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Comma-separated models to test'
+        default: 'gpt-4o-mini'
+      threshold:
+        description: 'Alert threshold (%)'
+        default: '15'
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run evaluations
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 drift.py run \
+            --models "${{ github.event.inputs.models || 'gpt-4o-mini' }}" \
+            --json > run-results.json
+          cat run-results.json
+
+      - name: Check for regressions
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 drift.py alert \
+            --threshold ${{ github.event.inputs.threshold || '15' }} \
+            --json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-results-${{ github.run_number }}
+          path: |
+            drift.db
+            run-results.json
+
+      - name: Export report
+        if: always()
+        run: python3 drift.py report --json > report.json 2>&1 || true
