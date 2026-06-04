@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install httpx
+      - name: Syntax check
+        run: python -m py_compile drift.py && python -c "import drift"
+      - name: Demo run
+        run: |
+          python drift.py init
+          python drift.py check
+          python drift.py run --demo
+          python drift.py run --demo --parallel --models "gpt-4o-mini,gpt-4o"
+          python drift.py report
+          python drift.py alert
+          python drift.py test --a "test prompt A" --b "test prompt B" --demo --n 2
+          python drift.py export --format json -o /tmp/export.json
+          python drift.py clean --cache
+          python drift.py versions
+          python drift.py history --last 5
